@@ -1,0 +1,30 @@
+[
+  {
+    "adapter_name": "swerebenchv2",
+    "adapter_builders": [],
+    "original_benchmark": [
+      {
+        "split": "train",
+        "size": 32079,
+        "harness": "agent",
+        "supported_agents": ["openhands", "codex", "claude-code"],
+        "adaptable": true,
+        "notes": "Full SWE-rebench-V2 dataset with 32,079 tasks spanning 20+ programming languages from real GitHub issues."
+      }
+    ],
+    "harbor_adapter": [
+      {
+        "split": "train",
+        "adapted_benchmark_size": 32079,
+        "parity_benchmark_size": null,
+        "parity_sampling_rate": null,
+        "registry_benchmark_size": null,
+        "added_agents": null,
+        "parity_matching_agents": null,
+        "parity_unmatching_agents": null,
+        "parity_costs": null,
+        "notes": "Initial adapter implementation. Parity experiments pending."
+      }
+    ]
+  }
+]

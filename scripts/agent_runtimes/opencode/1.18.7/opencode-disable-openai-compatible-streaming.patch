@@ -1,0 +1,191 @@
+--- a/packages/opencode/src/provider/provider.ts
++++ b/packages/opencode/src/provider/provider.ts
+@@ -9,7 +9,14 @@
+ import { Hash } from "@opencode-ai/core/util/hash"
+ import { Plugin } from "../plugin"
+ import { serviceUse } from "@opencode-ai/core/effect/service-use"
+-import { type LanguageModelV3 } from "@ai-sdk/provider"
++import {
++  type LanguageModelV3,
++  type LanguageModelV3CallOptions,
++  type LanguageModelV3Content,
++  type LanguageModelV3GenerateResult,
++  type LanguageModelV3StreamPart,
++  type LanguageModelV3StreamResult,
++} from "@ai-sdk/provider"
+ import { ModelsDev } from "@opencode-ai/core/models-dev"
+ import { Auth } from "../auth"
+ import { Env } from "../env"
+@@ -82,6 +89,142 @@
+   })
+ }
+ 
++function bufferGeneratedPart(
++  controller: ReadableStreamDefaultController<LanguageModelV3StreamPart>,
++  part: LanguageModelV3Content,
++  ids: { text: number; reasoning: number },
++) {
++  if (part.type === "text") {
++    const id = `txt-${ids.text++}`
++    controller.enqueue({
++      type: "text-start",
++      id,
++      providerMetadata: part.providerMetadata,
++    })
++    controller.enqueue({
++      type: "text-delta",
++      id,
++      delta: part.text,
++      providerMetadata: part.providerMetadata,
++    })
++    controller.enqueue({
++      type: "text-end",
++      id,
++      providerMetadata: part.providerMetadata,
++    })
++    return
++  }
++
++  if (part.type === "reasoning") {
++    const id = `reasoning-${ids.reasoning++}`
++    controller.enqueue({
++      type: "reasoning-start",
++      id,
++      providerMetadata: part.providerMetadata,
++    })
++    controller.enqueue({
++      type: "reasoning-delta",
++      id,
++      delta: part.text,
++      providerMetadata: part.providerMetadata,
++    })
++    controller.enqueue({
++      type: "reasoning-end",
++      id,
++      providerMetadata: part.providerMetadata,
++    })
++    return
++  }
++
++  if (part.type === "tool-call") {
++    controller.enqueue({
++      type: "tool-input-start",
++      id: part.toolCallId,
++      toolName: part.toolName,
++      providerMetadata: part.providerMetadata,
++      providerExecuted: part.providerExecuted,
++      dynamic: part.dynamic,
++    })
++    controller.enqueue({
++      type: "tool-input-delta",
++      id: part.toolCallId,
++      delta: part.input,
++      providerMetadata: part.providerMetadata,
++    })
++    controller.enqueue({
++      type: "tool-input-end",
++      id: part.toolCallId,
++      providerMetadata: part.providerMetadata,
++    })
++    controller.enqueue(part)
++    return
++  }
++
++  controller.enqueue(part as LanguageModelV3StreamPart)
++}
++
++function createBufferedStreamResult(
++  result: LanguageModelV3GenerateResult,
++  options: LanguageModelV3CallOptions,
++): LanguageModelV3StreamResult {
++  const stream = new ReadableStream<LanguageModelV3StreamPart>({
++    start(controller) {
++      controller.enqueue({ type: "stream-start", warnings: result.warnings })
++
++      if (options.includeRawChunks && result.response?.body !== undefined) {
++        controller.enqueue({ type: "raw", rawValue: result.response.body })
++      }
++
++      if (
++        result.response?.id !== undefined ||
++        result.response?.timestamp !== undefined ||
++        result.response?.modelId !== undefined
++      ) {
++        controller.enqueue({
++          type: "response-metadata",
++          id: result.response?.id,
++          timestamp: result.response?.timestamp,
++          modelId: result.response?.modelId,
++        })
++      }
++
++      const ids = { text: 0, reasoning: 0 }
++      for (const part of result.content) {
++        bufferGeneratedPart(controller, part, ids)
++      }
++
++      controller.enqueue({
++        type: "finish",
++        finishReason: result.finishReason,
++        usage: result.usage,
++        providerMetadata: result.providerMetadata,
++      })
++      controller.close()
++    },
++  })
++
++  return {
++    stream,
++    request: result.request,
++    response: {
++      headers: result.response?.headers,
++    },
++  }
++}
++
++function wrapBufferedLanguageModel(language: LanguageModelV3): LanguageModelV3 {
++  const wrapped = Object.create(language) as LanguageModelV3
++  wrapped.doStream = async (options) => {
++    const result = await language.doGenerate(options)
++    return createBufferedStreamResult(result, options)
++  }
++  return wrapped
++}
++
++function shouldBufferOpenAICompatibleModel(model: Model, options: Record<string, unknown>) {
++  return model.api.npm.includes("@ai-sdk/openai-compatible") && options["disableStreaming"] === true
++}
++
+ function timeoutController(ms: number) {
+   const ctl = new AbortController()
+   const id = setTimeout(() => ctl.abort(new ProviderError.HeaderTimeoutError(ms)), ms)
+@@ -1837,19 +1980,18 @@
+       return yield* EffectPromise.refineRejection(
+         async () => {
+           const sdk = await resolveSDK(model, s, envs)
++          const modelOptions = {
++            ...provider.options,
++            ...model.options,
++          }
+           const language = s.modelLoaders[model.providerID]
+-            ? await s.modelLoaders[model.providerID](
+-                sdk,
+-                model.api.id,
+-                {
+-                  ...provider.options,
+-                  ...model.options,
+-                },
+-                model,
+-              )
++            ? await s.modelLoaders[model.providerID](sdk, model.api.id, modelOptions, model)
+             : sdk.languageModel(model.api.id)
+-          s.models.set(key, language)
+-          return language
++          const resolved = shouldBufferOpenAICompatibleModel(model, modelOptions)
++            ? wrapBufferedLanguageModel(language)
++            : language
++          s.models.set(key, resolved)
++          return resolved
+         },
+         (cause) =>
+           cause instanceof NoSuchModelError

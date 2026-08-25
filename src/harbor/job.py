@@ -180,8 +180,14 @@ class Job:
         existing_config = JobConfig.model_validate_json(
             self._job_config_path.read_text()
         )
+        existing_config.quiet = self.config.quiet
+        existing_config.n_concurrent_trials = self.config.n_concurrent_trials
 
-        if existing_config != self.config:
+        # Resume credentials exist only in memory. Compare serialized forms so
+        # sensitive values use the same redaction as the saved config.
+        if existing_config.model_dump(mode="json") != self.config.model_dump(
+            mode="json"
+        ):
             raise FileExistsError(
                 f"Job directory {self.job_dir} already exists and cannot be "
                 "resumed with a different config."
@@ -193,15 +199,29 @@ class Job:
 
             trial_paths = TrialPaths(trial_dir)
 
-            if not trial_paths.result_path.exists():
-                shutil.rmtree(trial_paths.trial_dir)
-            else:
-                self._existing_trial_configs.append(
-                    TrialConfig.model_validate_json(trial_paths.config_path.read_text())
+            if (
+                not trial_paths.config_path.exists()
+                or not trial_paths.result_path.exists()
+            ):
+                shutil.rmtree(trial_paths.trial_dir, ignore_errors=True)
+                continue
+
+            try:
+                trial_config = TrialConfig.model_validate_json(
+                    trial_paths.config_path.read_text()
                 )
-                self._existing_trial_results.append(
-                    TrialResult.model_validate_json(trial_paths.result_path.read_text())
+                trial_result = TrialResult.model_validate_json(
+                    trial_paths.result_path.read_text()
                 )
+                self._existing_trial_configs.append(trial_config)
+                self._existing_trial_results.append(trial_result)
+            except (OSError, ValueError) as e:
+                logger.debug(
+                    "Removing invalid existing trial directory %s: %s",
+                    trial_paths.trial_dir,
+                    e,
+                )
+                shutil.rmtree(trial_paths.trial_dir, ignore_errors=True)
 
         for trial_result in self._existing_trial_results:
             agent_name = trial_result.agent_info.name
@@ -227,7 +247,51 @@ class Job:
         self._remaining_trial_configs = self._trial_configs.copy()
 
         for trial_config in self._existing_trial_configs:
-            self._remaining_trial_configs.remove(trial_config)
+            try:
+                self._remaining_trial_configs.remove(trial_config)
+            except ValueError:
+                matching_trial_config = next(
+                    (
+                        remaining_trial_config
+                        for remaining_trial_config in self._remaining_trial_configs
+                        if self._is_same_resume_trial(
+                            remaining_trial_config, trial_config
+                        )
+                    ),
+                    None,
+                )
+                if matching_trial_config is None:
+                    logger.debug(
+                        "Ignoring existing trial config that no longer matches this "
+                        "job config: %s",
+                        trial_config.trial_name,
+                    )
+                    continue
+
+                logger.debug(
+                    "Matched existing trial %s by task and agent identity despite "
+                    "config drift.",
+                    trial_config.trial_name,
+                )
+                self._remaining_trial_configs.remove(matching_trial_config)
+
+    @staticmethod
+    def _is_same_resume_trial(
+        generated_trial_config: TrialConfig, existing_trial_config: TrialConfig
+    ) -> bool:
+        generated_agent = generated_trial_config.agent
+        existing_agent = existing_trial_config.agent
+
+        return (
+            generated_trial_config.task == existing_trial_config.task
+            and generated_agent.name == existing_agent.name
+            and generated_agent.import_path == existing_agent.import_path
+            and generated_agent.model_name == existing_agent.model_name
+            and generated_agent.kwargs == existing_agent.kwargs
+            and generated_trial_config.environment == existing_trial_config.environment
+            and generated_trial_config.verifier == existing_trial_config.verifier
+            and generated_trial_config.artifacts == existing_trial_config.artifacts
+        )
 
     @staticmethod
     async def _resolve_task_configs(config: JobConfig) -> list[TaskConfig]:

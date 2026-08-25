@@ -35,6 +35,37 @@ jobs_app = Typer(
 console = Console()
 
 
+def apply_resume_agent_env_defaults(
+    config: JobConfig, *, allow_masked_secrets: bool | None = None
+) -> None:
+    """Restore masked agent env values in memory from the host environment."""
+    import os
+
+    unresolved: set[str] = set()
+    for agent in config.agents:
+        for env_key, saved_value in tuple(agent.env.items()):
+            if "****" not in saved_value:
+                continue
+            if env_value := os.environ.get(env_key):
+                agent.env[env_key] = env_value
+            else:
+                unresolved.add(env_key)
+
+        for env_key in ("LLM_API_KEY", "LLM_BASE_URL"):
+            if env_key not in agent.env and (env_value := os.environ.get(env_key)):
+                agent.env[env_key] = env_value
+
+    if allow_masked_secrets is None:
+        allow_masked_secrets = os.environ.get("ALLOW_MASKED_SECRETS") == "1"
+    if unresolved and not allow_masked_secrets:
+        keys = ", ".join(sorted(unresolved))
+        raise ValueError(
+            "Masked agent environment values remain for: "
+            f"{keys}. Export the corresponding variables before resuming, or set "
+            "ALLOW_MASKED_SECRETS=1 to continue intentionally."
+        )
+
+
 def _confirm_host_env_access(
     job,
     console: Console,
@@ -491,6 +522,15 @@ def start(
             show_default=False,
         ),
     ] = None,
+    agent_extra_allowed_hosts: Annotated[
+        list[str] | None,
+        Option(
+            "--agent-extra-allowed-host",
+            help="Additional host to allow when the effective agent network policy is no-network or allowlist. Can be used multiple times.",
+            rich_help_panel="Agent",
+            show_default=False,
+        ),
+    ] = None,
     environment_type: Annotated[
         EnvironmentType | None,
         Option(
@@ -848,6 +888,7 @@ def start(
         config.agents = []
         parsed_kwargs = parse_kwargs(agent_kwargs)
         parsed_env = parse_env_vars(agent_env)
+        parsed_extra_allowed_hosts = agent_extra_allowed_hosts or []
 
         if model_names is not None:
             config.agents = [
@@ -857,6 +898,7 @@ def start(
                     model_name=model_name,
                     kwargs=parsed_kwargs,
                     env=parsed_env,
+                    extra_allowed_hosts=parsed_extra_allowed_hosts,
                 )
                 for model_name in model_names
             ]
@@ -867,17 +909,21 @@ def start(
                     import_path=agent_import_path,
                     kwargs=parsed_kwargs,
                     env=parsed_env,
+                    extra_allowed_hosts=parsed_extra_allowed_hosts,
                 )
             ]
     else:
         parsed_kwargs = parse_kwargs(agent_kwargs)
         parsed_env = parse_env_vars(agent_env)
-        if parsed_kwargs or parsed_env:
+        parsed_extra_allowed_hosts = agent_extra_allowed_hosts or []
+        if parsed_kwargs or parsed_env or parsed_extra_allowed_hosts:
             for agent in config.agents:
                 if parsed_kwargs:
                     agent.kwargs.update(parsed_kwargs)
                 if parsed_env:
                     agent.env.update(parsed_env)
+                if parsed_extra_allowed_hosts:
+                    agent.extra_allowed_hosts.extend(parsed_extra_allowed_hosts)
 
     if environment_type is not None:
         config.environment.type = environment_type
@@ -1084,6 +1130,16 @@ def resume(
             show_default=False,
         ),
     ] = ["CancelledError"],
+    n_concurrent: Annotated[
+        int | None,
+        Option(
+            "-n",
+            "--n-concurrent",
+            min=1,
+            help="Override concurrent trials for this resume without rewriting config.json",
+            show_default=False,
+        ),
+    ] = None,
 ):
     """Resume an existing job from its job directory."""
     from harbor.job import Job
@@ -1123,6 +1179,10 @@ def resume(
                 shutil.rmtree(trial_dir)
 
     config = JobConfig.model_validate_json(config_path.read_text())
+
+    apply_resume_agent_env_defaults(config)
+    if n_concurrent is not None:
+        config.n_concurrent_trials = n_concurrent
 
     from harbor.environments.factory import EnvironmentFactory
 

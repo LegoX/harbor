@@ -34,6 +34,7 @@ class ServiceVolumeBind(TypedDict):
 
 class ServiceVolumeVolume(TypedDict):
     subpath: NotRequired[str]
+    nocopy: NotRequired[Literal[True]]
 
 
 class ServiceVolumeImage(TypedDict):
@@ -55,6 +56,54 @@ class ArtifactConfig(BaseModel):
     destination: str | None = None
 
 
+class PredictPatchConfig(BaseModel):
+    """Configuration for automatic git-diff capture after the agent runs.
+
+    When enabled, the trial framework probes each candidate repo path inside
+    the environment, finds the first one that is a git repository, and writes
+    the diff (including untracked content) to
+    ``/logs/artifacts/<output_filename>``. The file is then collected by the
+    standard artifacts mechanism into the trial's ``artifacts/`` directory.
+    """
+
+    enabled: bool = True
+    repo_paths: list[str] = Field(
+        default_factory=lambda: [
+            "/testbed",
+            "/app/src",
+            "/workspace",
+            "/app",
+            "/repo",
+        ]
+    )
+    output_filename: str = "predict_patch.diff"
+    auto_discover: bool = True
+    auto_discover_max_depth: int = 2
+    init_baseline: bool = True
+    baseline_tag: str = "harbor-baseline"
+    init_timeout_sec: int = 120
+    capture_timeout_sec: int = 60
+
+    @field_validator("output_filename")
+    @classmethod
+    def _validate_output_filename(cls, v: str) -> str:
+        if not v or v in (".", ".."):
+            raise ValueError("output_filename must be a non-empty basename")
+        if "/" in v or "\\" in v:
+            raise ValueError(
+                "output_filename must be a plain basename "
+                "(no path separators or parent-directory traversal)"
+            )
+        return v
+
+    @field_validator("init_timeout_sec", "capture_timeout_sec")
+    @classmethod
+    def _validate_positive_timeout(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("timeout must be positive")
+        return v
+
+
 class AgentConfig(BaseModel):
     name: str | None = None
     import_path: str | None = None
@@ -64,6 +113,7 @@ class AgentConfig(BaseModel):
     max_timeout_sec: float | None = None
     kwargs: dict[str, Any] = Field(default_factory=dict)
     env: dict[str, str] = Field(default_factory=dict)
+    extra_allowed_hosts: list[str] = Field(default_factory=list)
 
     @field_serializer("env")
     @classmethod
@@ -213,6 +263,7 @@ class TrialConfig(BaseModel):
     environment: EnvironmentConfig = Field(default_factory=EnvironmentConfig)
     verifier: VerifierConfig = Field(default_factory=VerifierConfig)
     artifacts: list[str | ArtifactConfig] = Field(default_factory=list)
+    predict_patch: PredictPatchConfig = Field(default_factory=PredictPatchConfig)
     job_id: UUID | None = None
 
     def __eq__(self, other):
@@ -234,6 +285,7 @@ class TrialConfig(BaseModel):
             and self.environment == other.environment
             and self.verifier == other.verifier
             and self.artifacts == other.artifacts
+            and self.predict_patch == other.predict_patch
         )
 
     @model_validator(mode="after")

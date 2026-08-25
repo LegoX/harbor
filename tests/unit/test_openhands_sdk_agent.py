@@ -32,7 +32,7 @@ class TestOpenHandsSDKAgent:
                 logs_dir=Path(tmpdir), model_name="anthropic/claude-sonnet-4-5"
             )
             assert agent._load_skills is True
-            assert agent._reasoning_effort == "high"
+            assert agent._reasoning_effort is None
             assert len(agent._skill_paths) > 0
 
     def test_init_custom_params(self):
@@ -84,8 +84,25 @@ class TestOpenHandsSDKAgent:
             assert env is not None
             assert env.get("LLM_API_KEY") == "test-key"
             assert env.get("LLM_MODEL") == "anthropic/claude-sonnet-4-5"
+            assert "LLM_REASONING_EFFORT" not in env
             assert "LOAD_SKILLS" in env
             assert "SKILL_PATHS" in env
+
+    @patch.dict("os.environ", {"LLM_API_KEY": "test-key"})
+    @pytest.mark.asyncio
+    async def test_run_with_explicit_reasoning_effort(self, tmp_path: Path):
+        agent = OpenHandsSDK(
+            logs_dir=tmp_path,
+            model_name="openai/gpt-5",
+            reasoning_effort="medium",
+        )
+        mock_env = AsyncMock()
+        mock_env.exec.return_value = AsyncMock(return_code=0, stdout="", stderr="")
+
+        await agent.run("Test instruction", mock_env, AsyncMock())
+
+        env = mock_env.exec.call_args_list[0].kwargs["env"]
+        assert env["LLM_REASONING_EFFORT"] == "medium"
 
     @patch.dict(
         "os.environ", {"LLM_API_KEY": "llm-key", "LLM_BASE_URL": "https://custom.api"}

@@ -8,7 +8,7 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from harbor.models.environment_type import EnvironmentType
-from harbor.models.task.config import EnvironmentConfig
+from harbor.models.task.config import EnvironmentConfig, NetworkMode, NetworkPolicy
 from harbor.models.trial.paths import TrialPaths
 from harbor.utils.env import resolve_env_vars
 from harbor.utils.logger import logger as global_logger
@@ -181,6 +181,10 @@ class BaseEnvironment(ABC):
     def can_disable_internet(self) -> bool:
         """Whether this environment type supports disabling internet access."""
 
+    @property
+    def supports_dynamic_network_policy(self) -> bool:
+        return False
+
     @abstractmethod
     def _validate_definition(self):
         """
@@ -216,6 +220,23 @@ class BaseEnvironment(ABC):
             raise ValueError(
                 f"allow_internet=False is not supported by {self.type().value} environment."
             )
+        baseline = self.task_env_config.resolve_baseline()
+        if (
+            baseline.network_mode != NetworkMode.PUBLIC
+            and not self.can_disable_internet
+        ):
+            raise ValueError(
+                f"network_mode={baseline.network_mode.value!r} is not supported by "
+                f"{self.type().value} environment."
+            )
+
+    async def apply_network_policy(self, policy: NetworkPolicy) -> None:
+        if policy.network_mode == NetworkMode.PUBLIC:
+            return
+        raise ValueError(
+            f"Dynamic network policy {policy.network_mode.value!r} is not supported "
+            f"by {self.type().value} environment."
+        )
 
     @classmethod
     def preflight(cls) -> None:

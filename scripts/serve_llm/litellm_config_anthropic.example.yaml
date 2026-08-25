@@ -1,0 +1,34 @@
+model_list:
+  - model_name: "claude-opus-4-6-aws"
+    model_info:
+      supports_reasoning: true
+      supports_xhigh_reasoning_effort: true
+    litellm_params:
+      model: "anthropic/claude-opus-4-6-aws"
+      api_base: "xxx"
+      api_key: "sk-xxx"
+      additional_drop_params:
+        - top_p
+      thinking:
+        type: "adaptive"
+        display: "summarized"
+      output_config:
+        effort: "high"
+      input_cost_per_token: 0.000014
+      output_cost_per_token: 0.00007
+
+router_settings:
+  optional_pre_call_checks:
+    # - prompt_caching
+    - responses_api_deployment_check
+    # Enable only when LiteLLM has a configured DB connection.
+    # - session_affinity
+
+general_settings:
+  master_key: "os.environ/LITELLM_MASTER_KEY"
+  disable_spend_logs: true
+
+litellm_settings:
+  drop_params: true
+  callbacks: "trajectory_logger.trajectory_logger"
+  use_chat_completions_url_for_anthropic_messages: false

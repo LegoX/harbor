@@ -19,7 +19,7 @@ from harbor.environments.docker import (
     COMPOSE_PREBUILT_PATH,
 )
 from harbor.models.environment_type import EnvironmentType
-from harbor.models.task.config import EnvironmentConfig
+from harbor.models.task.config import EnvironmentConfig, NetworkMode, NetworkPolicy
 from harbor.models.trial.config import ServiceVolumeConfig
 from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
 from harbor.utils.env import resolve_env_vars
@@ -91,6 +91,39 @@ class DockerEnvironment(BaseEnvironment):
 
     # Class-level lock per image name to prevent parallel builds of the same image.
     _image_build_locks: dict[str, asyncio.Lock] = {}
+    _global_build_semaphore: asyncio.Semaphore | None = None
+    _global_build_semaphore_loop: asyncio.AbstractEventLoop | None = None
+    _global_build_semaphore_limit: int | None = None
+
+    @classmethod
+    def _get_global_build_semaphore(cls) -> asyncio.Semaphore | None:
+        """Return the process-wide Docker build limiter, when configured."""
+        raw_limit = os.environ.get("HARBOR_DOCKER_BUILD_CONCURRENCY", "").strip()
+        if not raw_limit:
+            return None
+
+        try:
+            limit = int(raw_limit)
+        except ValueError as exc:
+            raise ValueError(
+                "HARBOR_DOCKER_BUILD_CONCURRENCY must be a positive integer"
+            ) from exc
+        if limit < 1:
+            raise ValueError(
+                "HARBOR_DOCKER_BUILD_CONCURRENCY must be a positive integer"
+            )
+
+        loop = asyncio.get_running_loop()
+        if (
+            cls._global_build_semaphore is None
+            or cls._global_build_semaphore_loop is not loop
+            or cls._global_build_semaphore_limit != limit
+        ):
+            cls._global_build_semaphore = asyncio.Semaphore(limit)
+            cls._global_build_semaphore_loop = loop
+            cls._global_build_semaphore_limit = limit
+
+        return cls._global_build_semaphore
 
     @classmethod
     def preflight(cls) -> None:
@@ -120,6 +153,7 @@ class DockerEnvironment(BaseEnvironment):
         task_env_config: EnvironmentConfig,
         keep_containers: bool = False,
         mounts_json: list[ServiceVolumeConfig] | None = None,
+        has_dynamic_network_policy: bool = False,
         *args,
         **kwargs,
     ):
@@ -134,6 +168,7 @@ class DockerEnvironment(BaseEnvironment):
 
         self._keep_containers = keep_containers
         self._mounts_json = mounts_json
+        self._has_dynamic_network_policy = has_dynamic_network_policy
         self._mounts_compose_path: Path | None = None
 
         self._env_vars = DockerEnvironmentEnvVars(
@@ -184,6 +219,10 @@ class DockerEnvironment(BaseEnvironment):
         return True
 
     @property
+    def supports_dynamic_network_policy(self) -> bool:
+        return True
+
+    @property
     def is_mounted(self) -> bool:
         return True
 
@@ -213,8 +252,10 @@ class DockerEnvironment(BaseEnvironment):
         - Relative paths (e.g. build context) resolve relative to the file
           where they are defined, regardless of -f order
 
-        When allow_internet is False, the no-network compose file is appended
-        last to set network_mode: none on the main service.
+        Legacy allow_internet=False tasks without dynamic phase policies use the
+        no-network compose file to set network_mode: none on the main service.
+        Explicit network_mode settings and dynamic policies are enforced after
+        startup so phases can still switch policy.
         """
         build_or_prebuilt = (
             self._DOCKER_COMPOSE_PREBUILT_PATH
@@ -234,14 +275,21 @@ class DockerEnvironment(BaseEnvironment):
         if self._mounts_compose_path:
             paths.append(self._mounts_compose_path)
 
-        if not self.task_env_config.allow_internet:
+        baseline = self.task_env_config.resolve_baseline()
+        if (
+            not self._has_dynamic_network_policy
+            and self.task_env_config.network_mode is None
+            and baseline.network_mode == NetworkMode.NO_NETWORK
+        ):
             paths.append(self._DOCKER_COMPOSE_NO_NETWORK_PATH)
 
         return paths
 
     def _write_mounts_compose_file(self) -> Path:
         """Write a docker-compose override file with additional volume mounts."""
-        compose = {"services": {"main": {"volumes": self._mounts_json}}}
+        compose: dict[str, object] = {
+            "services": {"main": {"volumes": list(self._mounts_json or [])}}
+        }
         path = self.trial_paths.trial_dir / "docker-compose-mounts.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(compose, indent=2))
@@ -256,6 +304,27 @@ class DockerEnvironment(BaseEnvironment):
                 f"{self._dockerfile_path} and {self._environment_docker_compose_path} "
                 "not found. Please ensure at least one of these files exist."
             )
+
+    @staticmethod
+    async def _terminate_process(
+        process: asyncio.subprocess.Process,
+    ) -> tuple[bytes | None, bytes | None]:
+        """Terminate a subprocess and wait for it to exit, killing it if needed."""
+        if process.returncode is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+
+        try:
+            return await asyncio.wait_for(process.communicate(), timeout=5)
+        except asyncio.TimeoutError:
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            return await process.communicate()
 
     async def _run_docker_compose_command(
         self, command: list[str], check: bool = True, timeout_sec: int | None = None
@@ -294,15 +363,11 @@ class DockerEnvironment(BaseEnvironment):
                 )
             else:
                 stdout_bytes, stderr_bytes = await process.communicate()
+        except asyncio.CancelledError:
+            await self._terminate_process(process)
+            raise
         except asyncio.TimeoutError:
-            process.terminate()
-            try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    process.communicate(), timeout=5
-                )
-            except asyncio.TimeoutError:
-                process.kill()
-                stdout_bytes, stderr_bytes = await process.communicate()
+            stdout_bytes, stderr_bytes = await self._terminate_process(process)
             raise RuntimeError(f"Command timed out after {timeout_sec} seconds")
 
         stdout = stdout_bytes.decode(errors="replace") if stdout_bytes else None
@@ -325,20 +390,105 @@ class DockerEnvironment(BaseEnvironment):
 
         return result
 
+    async def _run_docker_command(
+        self, command: list[str], check: bool = True, timeout_sec: int | None = None
+    ) -> ExecResult:
+        """Run a docker command and return the result."""
+        process = await asyncio.create_subprocess_exec(
+            "docker",
+            *command,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+
+        try:
+            if timeout_sec:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    process.communicate(), timeout=timeout_sec
+                )
+            else:
+                stdout_bytes, stderr_bytes = await process.communicate()
+        except asyncio.CancelledError:
+            await self._terminate_process(process)
+            raise
+        except asyncio.TimeoutError:
+            stdout_bytes, stderr_bytes = await self._terminate_process(process)
+            raise RuntimeError(f"Command timed out after {timeout_sec} seconds")
+
+        stdout = stdout_bytes.decode(errors="replace") if stdout_bytes else None
+        stderr = stderr_bytes.decode(errors="replace") if stderr_bytes else None
+
+        result = ExecResult(
+            stdout=stdout,
+            stderr=stderr,
+            return_code=process.returncode or 0,
+        )
+
+        if check and result.return_code != 0:
+            raise RuntimeError(
+                f"Docker command failed: {result.stdout or result.stderr}"
+            )
+
+        return result
+
+    async def _main_container_id(self) -> str:
+        result = await self._run_docker_compose_command(["ps", "-q", "main"])
+        container_id = (result.stdout or "").strip()
+        if not container_id:
+            raise RuntimeError("Could not resolve Docker main container id")
+        return container_id
+
+    async def _main_container_image(self, container_id: str) -> str:
+        result = await self._run_docker_command(
+            ["inspect", "--format", "{{.Image}}", container_id]
+        )
+        image = (result.stdout or "").strip()
+        if not image:
+            raise RuntimeError("Could not resolve Docker main container image")
+        return image
+
+    async def _exec_in_main_network_namespace(self, command: str) -> ExecResult:
+        container_id = await self._main_container_id()
+        image = await self._main_container_image(container_id)
+        return await self._run_docker_command(
+            [
+                "run",
+                "--rm",
+                "--network",
+                f"container:{container_id}",
+                "--cap-add",
+                "NET_ADMIN",
+                "--entrypoint",
+                "bash",
+                image,
+                "-c",
+                command,
+            ],
+            check=False,
+        )
+
     async def start(self, force_build: bool):
         if self._mounts_json:
             self._mounts_compose_path = self._write_mounts_compose_file()
 
         self._use_prebuilt = not force_build and self.task_env_config.docker_image
+        should_build = not self._use_prebuilt or self._uses_compose
 
-        if not self._use_prebuilt:
+        if should_build:
             # Serialize image builds: if multiple environments with the same image name
             # start concurrently, only one builds while others wait for the cached image.
+            # Custom Compose files may add buildable services even when main is prebuilt.
             lock = self._image_build_locks.setdefault(
                 self.environment_name, asyncio.Lock()
             )
             async with lock:
-                await self._run_docker_compose_command(["build"])
+                build_semaphore = self._get_global_build_semaphore()
+                if build_semaphore is None:
+                    await self._run_docker_compose_command(["build"])
+                else:
+                    async with build_semaphore:
+                        await self._run_docker_compose_command(["build"])
 
         # Remove any stale containers from previous runs with the same session ID.
         try:
@@ -346,7 +496,10 @@ class DockerEnvironment(BaseEnvironment):
         except RuntimeError:
             pass
 
-        await self._run_docker_compose_command(["up", "--detach", "--wait"])
+        up_command = ["up", "--detach", "--wait"]
+        if should_build:
+            up_command.append("--no-build")
+        await self._run_docker_compose_command(up_command)
 
         # Make log directories world-writable so non-root agent/verifier
         # users can write to them.
@@ -495,6 +648,125 @@ class DockerEnvironment(BaseEnvironment):
         return await self._run_docker_compose_command(
             exec_command, check=False, timeout_sec=timeout_sec
         )
+
+    async def apply_network_policy(self, policy: NetworkPolicy) -> None:
+        if policy.network_mode == NetworkMode.PUBLIC:
+            command = """
+set -euo pipefail
+if command -v iptables >/dev/null 2>&1; then
+  iptables -P OUTPUT ACCEPT
+  iptables -F OUTPUT
+fi
+if command -v ip6tables >/dev/null 2>&1 && ip6tables -L OUTPUT >/dev/null 2>&1; then
+  ip6tables -P OUTPUT ACCEPT
+  ip6tables -F OUTPUT
+fi
+"""
+            result = await self._exec_in_main_network_namespace(command)
+            if result.return_code != 0:
+                raise RuntimeError(
+                    "Failed to restore public Docker network policy: "
+                    f"{result.stdout or result.stderr}"
+                )
+            return
+
+        allowed_hosts = " ".join(shlex.quote(host) for host in policy.allowed_hosts)
+        command = f"""
+set -euo pipefail
+if ! command -v iptables >/dev/null 2>&1; then
+  echo "iptables is required for Docker network policy enforcement" >&2
+  exit 127
+fi
+
+# Prefer filtering IPv6. Some Docker hosts do not expose the ip6table_filter
+# kernel module to unprivileged users, and legacy ip6tables then fails even
+# though the binary is installed. In that case, disable IPv6 inside this
+# network namespace. If that is also unavailable, only proceed when the
+# namespace has no usable IPv6 egress.
+ipv6_policy="unavailable"
+if command -v ip6tables >/dev/null 2>&1 && \\
+   ip6tables -L OUTPUT >/dev/null 2>&1; then
+  ipv6_policy="iptables"
+else
+  disable_ipv6_path="/proc/sys/net/ipv6/conf/all/disable_ipv6"
+  if [ -e "$disable_ipv6_path" ] && \\
+     printf '1\\n' >"$disable_ipv6_path" 2>/dev/null && \\
+     [ "$(cat "$disable_ipv6_path")" = "1" ]; then
+    default_disable_ipv6_path="/proc/sys/net/ipv6/conf/default/disable_ipv6"
+    if [ -e "$default_disable_ipv6_path" ]; then
+      printf '1\\n' >"$default_disable_ipv6_path" 2>/dev/null || true
+    fi
+    ipv6_policy="disabled"
+  else
+    ipv6_non_loopback_address=""
+    if [ ! -e "/proc/net/if_inet6" ]; then
+      ipv6_policy="unconfigured"
+    elif [ -r "/proc/net/if_inet6" ]; then
+      while read -r address _index _prefix _scope _flags interface_name; do
+        if [ "$interface_name" != "lo" ]; then
+          ipv6_non_loopback_address="$address"
+          break
+        fi
+      done < "/proc/net/if_inet6"
+      if [ -z "$ipv6_non_loopback_address" ]; then
+        ipv6_policy="unconfigured"
+      fi
+    fi
+  fi
+fi
+if [ "$ipv6_policy" = "unavailable" ]; then
+  echo "IPv6 filtering is unavailable and IPv6 egress could not be disabled" >&2
+  exit 127
+fi
+
+iptables -P OUTPUT ACCEPT
+iptables -F OUTPUT
+iptables -A OUTPUT -o lo -j ACCEPT
+if [ "$ipv6_policy" = "iptables" ]; then
+  ip6tables -P OUTPUT ACCEPT
+  ip6tables -F OUTPUT
+  ip6tables -A OUTPUT -o lo -j ACCEPT
+fi
+if [ {shlex.quote(policy.network_mode.value)} = {shlex.quote(NetworkMode.ALLOWLIST.value)} ]; then
+  allowed_hosts=({allowed_hosts})
+  for host in "${{allowed_hosts[@]}}"; do
+    case "$host" in
+      *'*'*)
+        echo "Wildcard allowed_hosts are not supported by local Docker iptables policy: $host" >&2
+        exit 2
+        ;;
+      *[!0-9.]*)
+        if ! command -v getent >/dev/null 2>&1; then
+          echo "getent is required to resolve Docker network-policy hostnames" >&2
+          exit 127
+        fi
+        ips="$(getent ahostsv4 "$host" | awk '{{print $1}}' | sort -u)"
+        ;;
+      *)
+        ips="$host"
+        ;;
+    esac
+    if [ -z "${{ips:-}}" ]; then
+      echo "Could not resolve allowed host: $host" >&2
+      exit 1
+    fi
+    for ip in $ips; do
+      iptables -A OUTPUT -p tcp -d "$ip" -j ACCEPT
+      iptables -A OUTPUT -p udp -d "$ip" -j ACCEPT
+    done
+  done
+fi
+iptables -P OUTPUT DROP
+if [ "$ipv6_policy" = "iptables" ]; then
+  ip6tables -P OUTPUT DROP
+fi
+"""
+        result = await self._exec_in_main_network_namespace(command)
+        if result.return_code != 0:
+            raise RuntimeError(
+                "Failed to apply Docker network policy "
+                f"{policy.network_mode.value!r}: {result.stdout or result.stderr}"
+            )
 
     async def attach(self) -> None:
         variables = " ".join(

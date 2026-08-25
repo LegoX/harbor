@@ -4,6 +4,7 @@
 import re
 import tomllib
 import warnings
+from enum import StrEnum
 from typing import Any
 
 import toml
@@ -71,6 +72,20 @@ class VerifierConfig(BaseModel):
         default=None,
         description="Username or UID to run the verifier as. None uses the environment's default USER (e.g., root).",
     )
+    network_mode: "NetworkMode | None" = None
+    allowed_hosts: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_network_policy(self) -> "VerifierConfig":
+        self.network_mode, self.allowed_hosts = _validate_network_policy_fields(
+            self.network_mode,
+            self.allowed_hosts,
+            section="verifier",
+        )
+        return self
+
+    def explicit_phase_policy(self) -> "NetworkPolicy | None":
+        return _explicit_network_policy(self.network_mode, self.allowed_hosts)
 
 
 class SolutionConfig(BaseModel):
@@ -83,6 +98,86 @@ class AgentConfig(BaseModel):
         default=None,
         description="Username or UID to run the agent as. None uses the environment's default USER (e.g., root).",
     )
+    network_mode: "NetworkMode | None" = None
+    allowed_hosts: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_network_policy(self) -> "AgentConfig":
+        self.network_mode, self.allowed_hosts = _validate_network_policy_fields(
+            self.network_mode,
+            self.allowed_hosts,
+            section="agent",
+        )
+        return self
+
+    def explicit_phase_policy(self) -> "NetworkPolicy | None":
+        return _explicit_network_policy(self.network_mode, self.allowed_hosts)
+
+
+class NetworkMode(StrEnum):
+    PUBLIC = "public"
+    NO_NETWORK = "no-network"
+    ALLOWLIST = "allowlist"
+
+
+class NetworkPolicy(BaseModel):
+    network_mode: NetworkMode = NetworkMode.PUBLIC
+    allowed_hosts: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_allowed_hosts(self) -> "NetworkPolicy":
+        if self.network_mode != NetworkMode.ALLOWLIST and self.allowed_hosts:
+            raise ValueError(
+                "allowed_hosts is only valid when network_mode='allowlist'."
+            )
+        self.allowed_hosts = normalize_allowed_hosts(self.allowed_hosts)
+        return self
+
+
+def normalize_allowed_hosts(hosts: list[str]) -> list[str]:
+    normalized: list[str] = []
+    for host in hosts:
+        value = str(host).strip().lower().rstrip(".")
+        if not value:
+            continue
+        if "://" in value or "/" in value or ":" in value:
+            raise ValueError(
+                "allowed_hosts entries must be hostnames or IPv4 addresses, not URLs, "
+                f"CIDRs, ports, or paths: {host!r}"
+            )
+        if value not in normalized:
+            normalized.append(value)
+    return normalized
+
+
+def _validate_network_policy_fields(
+    network_mode: NetworkMode | None,
+    allowed_hosts: list[str],
+    *,
+    section: str,
+) -> tuple[NetworkMode | None, list[str]]:
+    if not allowed_hosts:
+        return network_mode, allowed_hosts
+
+    normalized_hosts = normalize_allowed_hosts(allowed_hosts)
+    if network_mode is None:
+        return NetworkMode.ALLOWLIST, normalized_hosts
+    if network_mode != NetworkMode.ALLOWLIST:
+        raise ValueError(
+            f"{section}.allowed_hosts is only valid when "
+            f"{section}.network_mode='allowlist'."
+        )
+    return network_mode, normalized_hosts
+
+
+def _explicit_network_policy(
+    network_mode: NetworkMode | None,
+    allowed_hosts: list[str],
+) -> NetworkPolicy | None:
+    if network_mode is None and not allowed_hosts:
+        return None
+    mode = network_mode or NetworkMode.ALLOWLIST
+    return NetworkPolicy(network_mode=mode, allowed_hosts=allowed_hosts)
 
 
 class HealthcheckConfig(BaseModel):
@@ -132,6 +227,8 @@ class EnvironmentConfig(BaseModel):
         default=True,
         description="Whether to allow internet access in the environment.",
     )
+    network_mode: NetworkMode | None = None
+    allowed_hosts: list[str] = Field(default_factory=list)
     mcp_servers: list["MCPServerConfig"] = Field(default_factory=list)
     env: dict[str, str] = Field(
         default_factory=dict,
@@ -198,7 +295,23 @@ class EnvironmentConfig(BaseModel):
             self.storage_mb = self._parse_size_to_mb(self.storage)
             self.storage = None
 
+        self.network_mode, self.allowed_hosts = _validate_network_policy_fields(
+            self.network_mode,
+            self.allowed_hosts,
+            section="environment",
+        )
+
         return self
+
+    def resolve_baseline(self) -> NetworkPolicy:
+        if self.network_mode is not None:
+            return NetworkPolicy(
+                network_mode=self.network_mode,
+                allowed_hosts=self.allowed_hosts,
+            )
+        if not self.allow_internet:
+            return NetworkPolicy(network_mode=NetworkMode.NO_NETWORK)
+        return NetworkPolicy(network_mode=NetworkMode.PUBLIC)
 
 
 class MCPServerConfig(BaseModel):

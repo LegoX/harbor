@@ -66,3 +66,29 @@ class TestAgentInstallExecution:
             assert len(root_calls) >= 1, (
                 f"{agent_class.__name__} should have at least one root exec call"
             )
+
+
+class TestOpenHandsInstallExecution:
+    """Test OpenHands-specific installation settings."""
+
+    @pytest.mark.asyncio
+    async def test_installs_compatible_mcp_dependencies(self, temp_dir):
+        agent = OpenHands(
+            logs_dir=temp_dir,
+            version="1.1.0",
+        )
+        environment = AsyncMock()
+        environment.default_user = "root"
+        environment.exec.return_value = AsyncMock(return_code=0, stdout="", stderr="")
+
+        await agent.install(environment)
+
+        install_call = next(
+            call
+            for call in environment.exec.call_args_list
+            if "uv pip install" in call.kwargs["command"]
+        )
+        assert (
+            "uv pip install openhands-ai==1.1.0 'mcp<2' pydantic-settings"
+            in install_call.kwargs["command"]
+        )

@@ -1,14 +1,17 @@
 """Unit tests for DockerEnvironment command construction."""
 
+import asyncio
+import json
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from harbor.environments.base import ExecResult
 from harbor.environments.docker.docker import DockerEnvironment
-from harbor.models.task.config import EnvironmentConfig
+from harbor.environments.docker import COMPOSE_NO_NETWORK_PATH
+from harbor.models.task.config import EnvironmentConfig, NetworkMode, NetworkPolicy
 from harbor.models.trial.paths import TrialPaths
 
 
@@ -274,6 +277,204 @@ class TestChownBeforeDownload:
         docker_env.exec.assert_not_called()
 
 
+class TestMountComposeOverride:
+    """Tests for compose overrides generated from mounts_json."""
+
+    def test_write_mounts_compose_file_passthrough_custom_mounts(self, docker_env):
+        """mounts_json is passed through to the compose services.main.volumes list."""
+        docker_env._mounts_json = [
+            {
+                "type": "bind",
+                "source": "/data",
+                "target": "/mnt/data",
+                "read_only": True,
+                "bind": {"create_host_path": False},
+            },
+        ]
+
+        path = docker_env._write_mounts_compose_file()
+        compose = json.loads(path.read_text())
+
+        assert compose == {
+            "services": {
+                "main": {
+                    "volumes": [
+                        {
+                            "type": "bind",
+                            "source": "/data",
+                            "target": "/mnt/data",
+                            "read_only": True,
+                            "bind": {"create_host_path": False},
+                        }
+                    ]
+                }
+            }
+        }
+
+    def test_write_mounts_compose_file_preserves_image_mounts(self, docker_env):
+        docker_env._mounts_json = [
+            {
+                "type": "image",
+                "source": "docker.io/example/runtime:1.14.0",
+                "target": "/opt/custom-agent-runtime/oh-sdk",
+                "read_only": True,
+                "image": {"subpath": "opt/custom-agent-runtime/oh-sdk"},
+            }
+        ]
+
+        path = docker_env._write_mounts_compose_file()
+        compose = json.loads(path.read_text())
+
+        assert compose == {
+            "services": {
+                "main": {
+                    "volumes": [
+                        {
+                            "type": "image",
+                            "source": "docker.io/example/runtime:1.14.0",
+                            "target": "/opt/custom-agent-runtime/oh-sdk",
+                            "read_only": True,
+                            "image": {"subpath": "opt/custom-agent-runtime/oh-sdk"},
+                        }
+                    ]
+                }
+            }
+        }
+
+
+class TestNetworkPolicyCompose:
+    def test_legacy_allow_internet_false_uses_no_network_compose(
+        self, temp_dir
+    ) -> None:
+        env_dir = temp_dir / "environment"
+        env_dir.mkdir()
+        (env_dir / "Dockerfile").write_text("FROM ubuntu:22.04\n")
+        trial_paths = TrialPaths(trial_dir=temp_dir / "trial")
+        trial_paths.mkdir()
+
+        docker_env = DockerEnvironment(
+            environment_dir=env_dir,
+            environment_name="test-task",
+            session_id="test-task__abc123",
+            trial_paths=trial_paths,
+            task_env_config=EnvironmentConfig(
+                docker_image="ubuntu:22.04",
+                allow_internet=False,
+            ),
+        )
+
+        assert COMPOSE_NO_NETWORK_PATH in docker_env._docker_compose_paths
+
+    def test_explicit_public_network_mode_overrides_legacy_no_network_compose(
+        self, temp_dir
+    ) -> None:
+        env_dir = temp_dir / "environment"
+        env_dir.mkdir()
+        (env_dir / "Dockerfile").write_text("FROM ubuntu:22.04\n")
+        trial_paths = TrialPaths(trial_dir=temp_dir / "trial")
+        trial_paths.mkdir()
+
+        docker_env = DockerEnvironment(
+            environment_dir=env_dir,
+            environment_name="test-task",
+            session_id="test-task__abc123",
+            trial_paths=trial_paths,
+            task_env_config=EnvironmentConfig(
+                docker_image="ubuntu:22.04",
+                allow_internet=False,
+                network_mode=NetworkMode.PUBLIC,
+            ),
+        )
+
+        assert COMPOSE_NO_NETWORK_PATH not in docker_env._docker_compose_paths
+
+    def test_dynamic_network_policy_skips_legacy_no_network_compose(
+        self, temp_dir
+    ) -> None:
+        env_dir = temp_dir / "environment"
+        env_dir.mkdir()
+        (env_dir / "Dockerfile").write_text("FROM ubuntu:22.04\n")
+        trial_paths = TrialPaths(trial_dir=temp_dir / "trial")
+        trial_paths.mkdir()
+
+        docker_env = DockerEnvironment(
+            environment_dir=env_dir,
+            environment_name="test-task",
+            session_id="test-task__abc123",
+            trial_paths=trial_paths,
+            task_env_config=EnvironmentConfig(
+                docker_image="ubuntu:22.04",
+                allow_internet=False,
+            ),
+            has_dynamic_network_policy=True,
+        )
+
+        assert COMPOSE_NO_NETWORK_PATH not in docker_env._docker_compose_paths
+
+
+class TestDockerNetworkPolicy:
+    async def test_public_policy_restore_failure_is_reported(self, docker_env) -> None:
+        docker_env._exec_in_main_network_namespace = AsyncMock(
+            return_value=ExecResult(return_code=1, stderr="iptables failed")
+        )
+
+        with pytest.raises(RuntimeError, match="restore public.*iptables failed"):
+            await docker_env.apply_network_policy(
+                NetworkPolicy(network_mode=NetworkMode.PUBLIC)
+            )
+
+    async def test_restricted_policy_has_fail_closed_ipv6_fallback(
+        self, docker_env
+    ) -> None:
+        compose_commands: list[list[str]] = []
+        docker_commands: list[list[str]] = []
+
+        async def track_compose(command, **kwargs):
+            compose_commands.append(command)
+            return ExecResult(return_code=0, stdout="main-container\n")
+
+        async def track_docker(command, **kwargs):
+            docker_commands.append(command)
+            if command[:2] == ["inspect", "--format"]:
+                return ExecResult(return_code=0, stdout="sha256:main-image\n")
+            return ExecResult(return_code=0)
+
+        docker_env._run_docker_compose_command = AsyncMock(side_effect=track_compose)
+        docker_env._run_docker_command = AsyncMock(side_effect=track_docker)
+
+        await docker_env.apply_network_policy(
+            NetworkPolicy(network_mode=NetworkMode.NO_NETWORK)
+        )
+
+        assert compose_commands == [["ps", "-q", "main"]]
+        assert docker_commands[0] == [
+            "inspect",
+            "--format",
+            "{{.Image}}",
+            "main-container",
+        ]
+        assert docker_commands[1][:9] == [
+            "run",
+            "--rm",
+            "--network",
+            "container:main-container",
+            "--cap-add",
+            "NET_ADMIN",
+            "--entrypoint",
+            "bash",
+            "sha256:main-image",
+        ]
+        command = docker_commands[1][-1]
+        assert "command -v ip6tables" in command
+        assert "ip6tables -L OUTPUT" in command
+        assert "/proc/sys/net/ipv6/conf/all/disable_ipv6" in command
+        assert "/proc/net/if_inet6" in command
+        assert 'interface_name" != "lo' in command
+        assert "IPv6 egress could not be disabled" in command
+        assert "ESTABLISHED,RELATED" not in command
+        assert "ip6tables -P OUTPUT DROP" in command
+
+
 class TestStartStaleContainerCleanup:
     """Tests for the stale container cleanup in start()."""
 
@@ -309,7 +510,7 @@ class TestStartStaleContainerCleanup:
         assert calls[:3] == [
             ["build"],
             ["down", "--remove-orphans"],
-            ["up", "--detach", "--wait"],
+            ["up", "--detach", "--wait", "--no-build"],
         ]
 
     async def test_start_proceeds_when_down_fails(self, docker_env):
@@ -343,6 +544,163 @@ class TestStartStaleContainerCleanup:
 
         with pytest.raises(RuntimeError, match="Container creation failed"):
             await docker_env.start(force_build=False)
+
+
+class TestGlobalBuildConcurrency:
+    """Tests for the process-wide Docker build limiter."""
+
+    async def test_limits_builds_across_different_images(self, temp_dir, monkeypatch):
+        monkeypatch.setenv("HARBOR_DOCKER_BUILD_CONCURRENCY", "2")
+        DockerEnvironment._global_build_semaphore = None
+        DockerEnvironment._global_build_semaphore_loop = None
+        DockerEnvironment._global_build_semaphore_limit = None
+
+        active_builds = 0
+        max_active_builds = 0
+
+        async def track_calls(command, **kwargs):
+            nonlocal active_builds, max_active_builds
+            if command == ["build"]:
+                active_builds += 1
+                max_active_builds = max(max_active_builds, active_builds)
+                await asyncio.sleep(0.01)
+                active_builds -= 1
+            return ExecResult(return_code=0)
+
+        environments = []
+        for index in range(4):
+            environment_dir = temp_dir / f"environment-{index}"
+            environment_dir.mkdir()
+            (environment_dir / "Dockerfile").write_text("FROM ubuntu:22.04\n")
+
+            trial_dir = temp_dir / f"trial-{index}"
+            trial_dir.mkdir()
+            trial_paths = TrialPaths(trial_dir=trial_dir)
+            trial_paths.mkdir()
+
+            environment = DockerEnvironment(
+                environment_dir=environment_dir,
+                environment_name=f"test-task-{index}",
+                session_id=f"test-task-{index}__abc123",
+                trial_paths=trial_paths,
+                task_env_config=EnvironmentConfig(),
+            )
+            environment._run_docker_compose_command = AsyncMock(side_effect=track_calls)
+            environments.append(environment)
+
+        async with asyncio.TaskGroup() as task_group:
+            for environment in environments:
+                task_group.create_task(environment.start(force_build=False))
+
+        assert max_active_builds == 2
+
+    async def test_limits_compose_service_builds_with_prebuilt_main(
+        self, temp_dir, monkeypatch
+    ):
+        monkeypatch.setenv("HARBOR_DOCKER_BUILD_CONCURRENCY", "1")
+        DockerEnvironment._global_build_semaphore = None
+        DockerEnvironment._global_build_semaphore_loop = None
+        DockerEnvironment._global_build_semaphore_limit = None
+
+        environment_dir = temp_dir / "environment"
+        environment_dir.mkdir()
+        (environment_dir / "docker-compose.yaml").write_text(
+            "services:\n  helper:\n    build:\n      context: ./helper\n"
+        )
+
+        trial_dir = temp_dir / "trial"
+        trial_dir.mkdir()
+        trial_paths = TrialPaths(trial_dir=trial_dir)
+        trial_paths.mkdir()
+
+        environment = DockerEnvironment(
+            environment_dir=environment_dir,
+            environment_name="test-task",
+            session_id="test-task__abc123",
+            trial_paths=trial_paths,
+            task_env_config=EnvironmentConfig(docker_image="ubuntu:22.04"),
+        )
+        calls: list[list[str]] = []
+        build_was_limited = False
+
+        async def track_calls(command, **kwargs):
+            nonlocal build_was_limited
+            calls.append(command)
+            if command == ["build"]:
+                semaphore = environment._get_global_build_semaphore()
+                build_was_limited = semaphore is not None and semaphore.locked()
+            return ExecResult(return_code=0)
+
+        environment._run_docker_compose_command = AsyncMock(side_effect=track_calls)
+
+        await environment.start(force_build=False)
+
+        assert calls[:3] == [
+            ["build"],
+            ["down", "--remove-orphans"],
+            ["up", "--detach", "--wait", "--no-build"],
+        ]
+        assert build_was_limited
+
+    async def test_cancelled_build_exits_before_releasing_permit(
+        self, docker_env, monkeypatch
+    ):
+        monkeypatch.setenv("HARBOR_DOCKER_BUILD_CONCURRENCY", "1")
+        DockerEnvironment._global_build_semaphore = None
+        DockerEnvironment._global_build_semaphore_loop = None
+        DockerEnvironment._global_build_semaphore_limit = None
+
+        communicate_started = asyncio.Event()
+        process_terminated = asyncio.Event()
+        allow_process_exit = asyncio.Event()
+        communicate_calls = 0
+
+        async def communicate():
+            nonlocal communicate_calls
+            communicate_calls += 1
+            if communicate_calls == 1:
+                communicate_started.set()
+                await asyncio.Future()
+            await allow_process_exit.wait()
+            process.returncode = -15
+            return b"", None
+
+        process = MagicMock()
+        process.returncode = None
+        process.communicate = AsyncMock(side_effect=communicate)
+        process.terminate.side_effect = process_terminated.set
+
+        semaphore = docker_env._get_global_build_semaphore()
+        assert semaphore is not None
+
+        with patch(
+            "harbor.environments.docker.docker.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=process),
+        ):
+            build_task = asyncio.create_task(docker_env.start(force_build=True))
+            await communicate_started.wait()
+            build_task.cancel()
+            await process_terminated.wait()
+
+            assert semaphore.locked()
+            assert not build_task.done()
+
+            allow_process_exit.set()
+            with pytest.raises(asyncio.CancelledError):
+                await build_task
+
+        assert communicate_calls == 2
+        assert not semaphore.locked()
+
+    @pytest.mark.parametrize("value", ["0", "-1", "invalid"])
+    async def test_rejects_invalid_limit(self, docker_env, monkeypatch, value):
+        monkeypatch.setenv("HARBOR_DOCKER_BUILD_CONCURRENCY", value)
+
+        with pytest.raises(
+            ValueError,
+            match="HARBOR_DOCKER_BUILD_CONCURRENCY must be a positive integer",
+        ):
+            await docker_env.start(force_build=True)
 
 
 class TestStopChownBindMounts:

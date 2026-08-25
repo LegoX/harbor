@@ -143,6 +143,16 @@ class TestNonZeroExitCode:
 class TestExecSetupLogging:
     """Test debug logging behavior for setup command execution."""
 
+    def test_truncate_output_preserves_error_tail(self, temp_dir):
+        agent = ClaudeCode(logs_dir=temp_dir)
+        output = "start" + ("x" * 2000) + "final error"
+
+        truncated = agent._truncate_output(output)
+
+        assert truncated.startswith("start")
+        assert "[truncated]" in truncated
+        assert truncated.endswith("final error")
+
     @pytest.mark.asyncio
     async def test_exec_setup_logs_success(self, temp_dir, caplog):
         agent = ClaudeCode(logs_dir=temp_dir)

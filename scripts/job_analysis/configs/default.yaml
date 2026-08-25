@@ -1,0 +1,66 @@
+# =============================================================================
+# Profile: OpenHands JSONL（默认）
+# =============================================================================
+# 场景: 单个 log 目录内已有 OpenHands 聚合输出（trajectory + test + report）
+# 运行: python run.py --config configs/default.yaml
+# 说明: trajectory_layout / gold_source 使用默认值，无需在 YAML 中写出
+# =============================================================================
+
+# --- 必填 ---
+data:
+  log_dir: "logs/<your-eval-run>"   # 替换为实际 log 目录
+
+  # --- 以下有默认值，一般无需修改 ---
+  # trajectory_layout: openhands_jsonl   # 默认
+  # gold_source: jsonl                   # 默认
+  trajectory_file: "output.critic_attempt_1.jsonl"
+  test_file: "test-00000-of-00001.jsonl"
+  report_file: "output.critic_attempt_1.report.json"
+  errors_file: "output_errors.jsonl"
+  swebench_file: "output.critic_attempt_1.swebench.jsonl"
+
+  # instance_analysis 需要 Harbor dataset metadata 时取消注释:
+  # dataset_dir: "<path-to-dataset>/swebench-verified"
+
+# output.dir 未设置时自动推导为 output/<log_dir 目录名>
+output:
+  instances_jsonl: "instances.jsonl"
+  report_json: "report.json"
+
+# --- 分析范围 ---
+analysis:
+  include_resolved: false    # true 或 CLI --include-resolved 以生成 failed vs resolved 对比
+  include_errors: true
+  include_empty_patch: true
+
+# --- 特征阈值 ---
+features:
+  loop_threshold: 3
+  premature_stop_threshold: 0.3
+  tool_error_storm_threshold: 5
+
+# --- LLM Judge（默认关闭，启发式回退）---
+judge:
+  enabled: false
+  model: "claude-sonnet-4-6"
+  max_trajectory_chars: 8000
+
+hack_detector:
+  enabled: true
+
+# --- 可选阶段（主 pipeline 之外的扩展分析）---
+# task_analysis.enabled 默认 false；需要时设为 true 或 CLI --task-analysis
+
+instance_analysis:
+  enabled: false             # 需配置 data.dataset_dir
+  out_subdir: "instance_analysis"
+
+traj_analysis:
+  enabled: false             # OpenHands JSONL 需 trajectory 含 history 才可开启
+  out_subdir: "traj_analysis"
+
+# --- 写入 instances.jsonl 的元数据 ---
+scaffold: "openhands"
+model: "<your-model-name>"
+taxonomy_version: "v1"
+judge_version: "v1"

@@ -206,6 +206,9 @@ def main():
         "model": model,
         "api_key": api_key,
         "base_url": base_url,
+        # OpenHands SDK defaults this to "high". Passing None explicitly makes
+        # its request builder omit reasoning_effort and defer to the model API.
+        "reasoning_effort": os.environ.get("LLM_REASONING_EFFORT") or None,
     }
     if litellm_extra_body:
         llm_kwargs["litellm_extra_body"] = litellm_extra_body

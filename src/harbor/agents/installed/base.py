@@ -294,7 +294,8 @@ class BaseInstalledAgent(BaseAgent, ABC):
         if not text:
             return "None"
         if len(text) > max_len:
-            return text[:max_len] + " ... [truncated]"
+            half_len = max_len // 2
+            return text[:half_len] + " ... [truncated] ... " + text[-half_len:]
         return text
 
     async def _exec(

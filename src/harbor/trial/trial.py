@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import shlex
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,7 @@ from harbor.agents.installed.base import BaseInstalledAgent, NonZeroAgentExitCod
 from harbor.environments.factory import EnvironmentFactory
 from harbor.models.agent.context import AgentContext
 from harbor.models.agent.name import AgentName
+from harbor.models.environment_type import EnvironmentType
 from harbor.models.task.task import Task
 from harbor.models.trial.config import ArtifactConfig, TrialConfig
 from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
@@ -28,6 +30,15 @@ from harbor.models.trial.result import (
 )
 from harbor.tasks.client import TaskClient
 from harbor.trial.hooks import TrialEvent, TrialHookEvent
+from harbor.trial.network_policy import (
+    requires_mutable_network_after_start,
+    resolve_agent_phase_policy,
+    resolve_verifier_phase_policy,
+    should_apply_agent_phase_policy,
+    should_apply_environment_baseline,
+    should_apply_legacy_baseline_for_dynamic_policy,
+    should_apply_verifier_phase_policy,
+)
 from harbor.utils.logger import logger
 from harbor.verifier.verifier import Verifier
 
@@ -76,6 +87,9 @@ class Trial:
         self.config = config
         self.job_id = config.job_id
         self._are_agent_logs_downloaded = False
+        self._predict_patch_captured = False
+        self._predict_patch_repo_path: str | None = None
+        self._predict_patch_baseline_sha: str | None = None
 
         self._hooks: dict[TrialEvent, list[TrialHookCallback]] = {
             event: [] for event in TrialEvent
@@ -106,6 +120,14 @@ class Trial:
             **extra_kwargs,
         )
 
+        environment_kwargs = {}
+        if self.config.environment.type == EnvironmentType.DOCKER:
+            environment_kwargs["has_dynamic_network_policy"] = (
+                requires_mutable_network_after_start(
+                    self._task.config, self.config.agent
+                )
+            )
+
         self._environment = EnvironmentFactory.create_environment_from_config(
             config=config.environment,
             environment_dir=self._task.paths.environment_dir,
@@ -114,6 +136,7 @@ class Trial:
             trial_paths=self._trial_paths,
             task_env_config=self._task.config.environment,
             logger=self._logger,
+            **environment_kwargs,
         )
 
         _agent_base_timeout = (
@@ -227,6 +250,10 @@ class Trial:
     def trial_dir(self) -> Path:
         return self.config.trials_dir / self.config.trial_name
 
+    def _ensure_trial_dir(self) -> None:
+        self._trial_paths.trial_dir.mkdir(parents=True, exist_ok=True)
+        self._trial_paths.config_path.write_text(self.config.model_dump_json(indent=4))
+
     async def _setup_environment(self) -> None:
         await self._invoke_hooks(TrialEvent.ENVIRONMENT_START)
 
@@ -236,6 +263,15 @@ class Trial:
 
         try:
             await self._start_environment_with_retry()
+            if should_apply_environment_baseline(self._task.config) or (
+                self._environment.supports_dynamic_network_policy
+                and should_apply_legacy_baseline_for_dynamic_policy(
+                    self._task.config, self.config.agent
+                )
+            ):
+                await self._environment.apply_network_policy(
+                    self._task.config.environment.resolve_baseline()
+                )
         finally:
             self.result.environment_setup.finished_at = datetime.now(timezone.utc)
 
@@ -281,6 +317,14 @@ class Trial:
 
         try:
             self.result.agent_result = AgentContext()
+            if should_apply_agent_phase_policy(self._task.config, self.config.agent):
+                await self._environment.apply_network_policy(
+                    resolve_agent_phase_policy(
+                        self._task.config,
+                        self.config.agent,
+                        self._task.config.environment.resolve_baseline(),
+                    )
+                )
 
             await asyncio.wait_for(
                 self._agent.run(
@@ -315,6 +359,13 @@ class Trial:
     )
     async def _verify_with_retry(self) -> None:
         try:
+            if should_apply_verifier_phase_policy(self._task.config, self.config.agent):
+                await self._environment.apply_network_policy(
+                    resolve_verifier_phase_policy(
+                        self._task.config,
+                        self._task.config.environment.resolve_baseline(),
+                    )
+                )
             verifier = Verifier(
                 task=self._task,
                 trial_paths=self._trial_paths,
@@ -352,6 +403,7 @@ class Trial:
 
         self.result.finished_at = datetime.now(timezone.utc)
 
+        self._ensure_trial_dir()
         self._trial_paths.result_path.write_text(self.result.model_dump_json(indent=4))
 
         await self._invoke_hooks(TrialEvent.END)
@@ -403,6 +455,184 @@ class Trial:
             )
         except Exception:
             self._logger.error("Failed to upload agent logs back to environment")
+
+    async def _init_predict_patch_baseline(self) -> None:
+        """Record an immutable git baseline before the agent runs (best-effort).
+
+        The first candidate repository is selected. Repositories without git
+        metadata are initialized and committed. The selected path and original
+        commit SHA are retained by the Harbor process, outside the agent
+        environment, so agent-side commits cannot move the diff baseline.
+
+        ``init_baseline`` controls only whether a missing repository is
+        initialized. Existing repositories are always probed. Auto-discovered
+        paths are not touched because they typically already have a real
+        ``.git``.
+
+        Never raises: failures are logged at debug level only.
+        """
+        cfg = self.config.predict_patch
+        if not cfg.enabled or not cfg.repo_paths:
+            return
+
+        quoted_paths = " ".join(shlex.quote(p) for p in cfg.repo_paths)
+        quoted_tag = shlex.quote(cfg.baseline_tag)
+        initialize_missing = "true" if cfg.init_baseline else "false"
+        marker = "__HARBOR_PREDICT_PATCH_BASELINE__"
+
+        script = (
+            "set -u; "
+            f"for d in {quoted_paths}; do "
+            '  if [ -d "$d" ]; then '
+            '    git config --global --add safe.directory "$d" >/dev/null 2>&1 || true; '
+            f'    if {initialize_missing} && ! git -C "$d" rev-parse '
+            "--is-inside-work-tree >/dev/null 2>&1; then "
+            '      ( cd "$d" && '
+            "        git init -q -b main && "
+            "        git add -A && "
+            "        git -c user.email=harbor@local -c user.name=harbor "
+            '          commit -q --allow-empty --no-verify -m "harbor predict_patch baseline" && '
+            f"        git tag {quoted_tag} "
+            "      ) >/dev/null 2>&1 || true; "
+            "    fi; "
+            '    if baseline_sha=$(git -C "$d" rev-parse HEAD 2>/dev/null); then '
+            f'      printf \'{marker}%s\\t%s\\n\' "$d" "$baseline_sha"; '
+            "      exit 0; "
+            "    fi; "
+            "  fi; "
+            "done; exit 0"
+        )
+
+        try:
+            result = await self._environment.exec(
+                command=script,
+                user="root",
+                timeout_sec=cfg.init_timeout_sec,
+            )
+            stdout = getattr(result, "stdout", None) or ""
+            for line in stdout.splitlines():
+                if not line.startswith(marker):
+                    continue
+                payload = line.removeprefix(marker)
+                repo_path, separator, baseline_sha = payload.partition("\t")
+                if separator and repo_path and baseline_sha:
+                    self._predict_patch_repo_path = repo_path
+                    self._predict_patch_baseline_sha = baseline_sha
+                    break
+        except Exception:
+            self._logger.debug(
+                "predict_patch baseline init failed (best-effort)", exc_info=True
+            )
+
+    async def _capture_predict_patch(self) -> None:
+        """Capture the agent's git diff into /logs/artifacts/ (best-effort).
+
+        Runs after the agent has finished and before the verifier modifies the
+        working tree. First probes each candidate path in
+        ``self.config.predict_patch.repo_paths`` and, when ``auto_discover``
+        is enabled, falls back to a bounded ``find`` for ``.git`` at shallow
+        depth (skipping system and Harbor mount paths). For each match it
+        uses the commit SHA retained before agent execution. If baseline
+        discovery did not complete, it falls back to the configured tag or
+        ``HEAD`` for compatibility. Stages everything (including untracked files), writes the
+        diff to ``/logs/artifacts/<output_filename>``, then resets the index
+        so the verifier sees an unmodified working tree.
+
+        Idempotent within a trial: re-invocations after a successful capture
+        are no-ops, so post-verifier exception paths cannot overwrite an
+        agent-phase diff.
+
+        Never raises: any failure is logged at debug level.
+        """
+        if self._predict_patch_captured:
+            return
+        cfg = self.config.predict_patch
+        if not cfg.enabled:
+            return
+        if not cfg.repo_paths and not cfg.auto_discover:
+            return
+
+        artifacts_dir = EnvironmentPaths.artifacts_dir.as_posix()
+        output_path = f"{artifacts_dir}/{cfg.output_filename}"
+
+        candidate_paths = (
+            [self._predict_patch_repo_path]
+            if self._predict_patch_repo_path
+            else cfg.repo_paths
+        )
+        quoted_paths = " ".join(shlex.quote(p) for p in candidate_paths)
+        quoted_artifacts_dir = shlex.quote(artifacts_dir)
+        quoted_output = shlex.quote(output_path)
+        quoted_tag = shlex.quote(cfg.baseline_tag)
+
+        if self._predict_patch_baseline_sha:
+            ref_selection = f"ref={shlex.quote(self._predict_patch_baseline_sha)}; "
+        else:
+            ref_selection = (
+                "ref=HEAD; "
+                f'if git -C "$d" rev-parse --verify --quiet {quoted_tag} '
+                f">/dev/null 2>&1; then ref={quoted_tag}; fi; "
+            )
+
+        capture_block = (
+            '    git config --global --add safe.directory "$d" >/dev/null 2>&1 || true; '
+            '    if git -C "$d" rev-parse --is-inside-work-tree >/dev/null 2>&1; then '
+            f"      {ref_selection}"
+            '      git -C "$d" add -A >/dev/null 2>&1 || true; '
+            f'      git -C "$d" diff --cached "$ref" > {quoted_output} 2>/dev/null || '
+            f'        git -C "$d" diff "$ref" > {quoted_output} 2>/dev/null || '
+            f"        : > {quoted_output}; "
+            '      git -C "$d" reset HEAD -- . >/dev/null 2>&1 || true; '
+        )
+
+        parts = [
+            f"set -u; mkdir -p {quoted_artifacts_dir}; ",
+        ]
+
+        if candidate_paths:
+            parts.append(
+                f"for d in {quoted_paths}; do "
+                '  if [ -e "$d/.git" ]; then '
+                f"{capture_block}"
+                '      echo "Captured predict_patch from $d"; '
+                "      exit 0; "
+                "    fi; "
+                "  fi; "
+                "done; "
+            )
+
+        if cfg.auto_discover:
+            max_depth = max(2, int(cfg.auto_discover_max_depth))
+            parts.append(
+                f"found=$(find / -mindepth 2 -maxdepth {max_depth} -type d -name .git "
+                "-not -path '/proc/*' -not -path '/sys/*' -not -path '/dev/*' "
+                "-not -path '/logs/*' -not -path '/tests/*' -not -path '/solution/*' "
+                "-not -path '/installed-agent/*' -not -path '/opt/*' "
+                "-print -quit 2>/dev/null); "
+                'if [ -n "$found" ]; then '
+                '  d="$(dirname "$found")"; '
+                f"{capture_block}"
+                '    echo "Captured predict_patch from $d (auto-discovered)"; '
+                "    exit 0; "
+                "  fi; "
+                "fi; "
+            )
+
+        parts.append('echo "No git repository found among candidate paths"; exit 0')
+
+        script = "".join(parts)
+
+        try:
+            await self._environment.exec(
+                command=script,
+                user="root",
+                timeout_sec=cfg.capture_timeout_sec,
+            )
+            self._predict_patch_captured = True
+        except Exception:
+            self._logger.debug(
+                "predict_patch capture failed (best-effort)", exc_info=True
+            )
 
     async def _download_artifacts(self) -> None:
         """Download artifacts from the environment (best-effort, never fails the trial).
@@ -518,8 +748,7 @@ class Trial:
                 self._logger.warning("Failed to write artifacts manifest (best-effort)")
 
     async def run(self) -> TrialResult:
-        self._trial_paths.trial_dir.mkdir(parents=True, exist_ok=True)
-        self._trial_paths.config_path.write_text(self.config.model_dump_json(indent=4))
+        self._ensure_trial_dir()
 
         self._result = TrialResult(
             trial_name=self.config.trial_name,
@@ -541,6 +770,7 @@ class Trial:
             self._environment.default_user = self._task.config.agent.user
             await self._setup_agent()
             self._result.agent_info = self._agent.to_agent_info()
+            await self._init_predict_patch_baseline()
 
             try:
                 self._environment.default_user = self._task.config.agent.user
@@ -551,9 +781,11 @@ class Trial:
                     target_dir=self._trial_paths.agent_dir,
                 )
                 self._maybe_populate_agent_context()
+                await self._capture_predict_patch()
 
             except (AgentTimeoutError, NonZeroAgentExitCodeError) as e:
                 self.result.exception_info = ExceptionInfo.from_exception(e)
+                self._ensure_trial_dir()
                 self._trial_paths.exception_message_path.write_text(
                     traceback.format_exc()
                 )
@@ -562,6 +794,7 @@ class Trial:
                     target_dir=self._trial_paths.agent_dir,
                 )
                 self._maybe_populate_agent_context()
+                await self._capture_predict_patch()
 
             self._environment.default_user = None
 
@@ -577,6 +810,7 @@ class Trial:
             self._logger.debug(f"Trial {self.config.trial_name} cancelled")
             if self.result.exception_info is None:
                 self.result.exception_info = ExceptionInfo.from_exception(e)
+                self._ensure_trial_dir()
                 self._trial_paths.exception_message_path.write_text(
                     traceback.format_exc()
                 )
@@ -586,6 +820,7 @@ class Trial:
                 target_dir=self._trial_paths.agent_dir,
             )
             self._maybe_populate_agent_context()
+            await self._capture_predict_patch()
             await self._download_artifacts()
             await self._invoke_hooks(TrialEvent.CANCEL)
 
@@ -602,10 +837,12 @@ class Trial:
 
             if self.result.exception_info is None:
                 self.result.exception_info = ExceptionInfo.from_exception(e)
+                self._ensure_trial_dir()
                 self._trial_paths.exception_message_path.write_text(
                     traceback.format_exc()
                 )
 
+            await self._capture_predict_patch()
             await self._download_artifacts()
 
         finally:

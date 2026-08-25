@@ -1,0 +1,11 @@
+# Core pipeline
+pyyaml>=6.0
+
+# instance_analysis (correlation p-values)
+scipy>=1.10
+
+# Optional: LLM judge (--judge)
+anthropic>=0.40
+
+# Dev / tests
+pytest>=8.0

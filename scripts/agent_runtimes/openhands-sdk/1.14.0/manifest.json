@@ -1,0 +1,23 @@
+{
+  "agent": "openhands-sdk",
+  "runtime_version": "1.14.0",
+  "python_version": "3.12",
+  "python_abis": [
+    "glibc",
+    "musl"
+  ],
+  "uv_version": "0.5.21",
+  "container_runtime_root": "/opt/custom-agent-runtime/oh-sdk",
+  "runtime_entrypoint": "runtime/run_openhands_harbor.py",
+  "runtime_env_script": "runtime-env.sh",
+  "packages": {
+    "openhands-sdk": "1.14.0",
+    "openhands-tools": "1.14.0",
+    "fastapi": "0.115.6",
+    "platformdirs": "4.3.6"
+  },
+  "notes": [
+    "Official flow: build the self-contained runtime image with build-runtime-image.sh and mount it with type: \"image\" in mounts_json (see docs_dev/custom-agents.md).",
+    "Pip/uv and package versions in this file are the single source of truth for reproducible runtime images."
+  ]
+}

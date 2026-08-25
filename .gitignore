@@ -209,6 +209,7 @@ __marimo__/
 
 jobs/
 trials/
+logs/
 *.ipynb
 /tasks/
 /datasets/
@@ -217,6 +218,7 @@ trials/
 ignore/
 !src/harbor/tasks/
 tmp/
+scripts/run_datasets/resume*
 .DS_Store
 .mcp.json
 /parity-experiments/
@@ -229,3 +231,23 @@ src/harbor/viewer/static/
 .codex
 apps/
 !apps/viewer/
+
+# Local uv cache when UV_CACHE_DIR points inside the repo
+.uv-cache/
+
+# Local LiteLLM proxy config may contain private endpoints or credentials
+scripts/serve_llm/litellm_config.yaml
+scripts/serve_llm/litellm_config_glm52.yaml
+scripts/serve_llm/litellm_config_*.yaml
+scripts/serve_llm/*_masked.yaml
+scripts/serve_llm/litellm_log/
+scripts/serve_llm/trajectories/
+
+# Generated trajectory profiling outputs
+scripts/misc/trajectory_profile_outputs/
+scripts/git_ignore/
+
+# Local benchmark launchers
+scripts/run_benchmarks/run_sweb_nohack_c-oh-sdk_1.14.0_qwen3_5_35b_a3b.sh
+scripts/run_benchmarks/run_sweb_nohack_c-oh-sdk-1.33.0_qwen3_5_35b_a3b.sh
+scripts/run_benchmarks/run_sweb100_nohack_c-oh-sdk-1.33.0_qwen3_5_35b_a3b.sh

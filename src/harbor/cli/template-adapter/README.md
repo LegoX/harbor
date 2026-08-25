@@ -88,7 +88,7 @@ from the harbor root to evaluate on the entire dataset.
 
 > [For adapter creators]: You will need to (1) upload the prepared task directories to https://github.com/laude-institute/harbor-datasets (2) Add your dataset entries to [registry.json](../../../registry.json) following a similar format as others. Only after all the PRs are merged, can you run the above scripts (otherwise the datasets are not yet registered). At development time, use the scripts below to run experiments.
 
-However, if you choose to prepare the task directories locally and/or with custom versions/subsets for evaluation, you may either use `harbor run` or `harbor trial`. Instructions for using the adapter code to prepare task directories are provided in the [Usage](#usage-create-task-directories) session.
+However, if you choose to prepare the task directories locally and/or with custom versions/subsets for evaluation, you may either use `harbor run` or `harbor trial`. Instructions for using the adapter code to prepare task directories are provided in the [Usage](#usage-create-task-directories) section.
 
 ### Using Job Configurations
 The example configuration file(s) for the adapter is provided under `harbor/adapters/{{ADAPTER_ID}}`. You may either use `-c path/to/configuration.yaml` or `-p path/to/dataset` to run evaluation on the entire benchmark after preparing the task directories locally.
@@ -104,7 +104,7 @@ uv run harbor run -c adapters/{{ADAPTER_ID}}/{{ADAPTER_ID}}.yaml -a <agent_name>
 uv run harbor run -p datasets/{{ADAPTER_ID}} -a <agent_name> -m "<model_name>"
 
 # Resume a previously started job
-uv run harbor job resume -p /path/to/jobs/directory
+uv run harbor job resume -p /path/to/job
 ```
 
 Results are saved in the `jobs/` directory by default (configurable via `jobs_dir` in the YAML config).

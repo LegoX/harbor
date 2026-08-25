@@ -1,0 +1,57 @@
+# =============================================================================
+# Profile: Harbor Job + OpenHands SDK — SWE-bench Pro
+# =============================================================================
+# 运行: python run.py --config configs/harbor_swep_openhands_sdk.yaml
+# 结构与 harbor_sweb_openhands_sdk.yaml 相同，仅 dataset 路径不同
+# =============================================================================
+
+data:
+  log_dir: "<path-to-harbor-job>"
+  dataset_dir: "<path-to-dataset>/swebenchpro"
+
+  trajectory_layout: harbor_job
+  gold_source: harbor_dataset
+  trajectory_subpath: "agent/litellm-trajectory.jsonl"
+  trial_result_file: "result.json"
+  trial_report_subpath: "verifier/report.json"
+  max_iterations_default: 200
+
+output:
+  instances_jsonl: "instances.jsonl"
+  report_json: "report.json"
+
+analysis:
+  include_resolved: true
+  include_errors: true
+  include_empty_patch: true
+
+features:
+  loop_threshold: 3
+  premature_stop_threshold: 0.3
+  tool_error_storm_threshold: 5
+
+judge:
+  enabled: false
+  model: "claude-sonnet-4-6"
+  max_trajectory_chars: 8000
+
+hack_detector:
+  enabled: true
+
+# task_analysis.enabled 默认 false
+
+instance_analysis:
+  enabled: true
+  out_subdir: "instance_analysis"
+
+traj_analysis:
+  enabled: true
+  out_subdir: "traj_analysis"
+  max_instances: null
+
+skip_main_pipeline: false
+
+scaffold: "openhands-sdk"
+model: "<your-model-name>"
+taxonomy_version: "v1"
+judge_version: "v1"

@@ -1,0 +1,50 @@
+[
+  {
+    "adapter_name": "openswe",
+    "adapter_builders": [],
+    "original_benchmark": [
+      {
+        "split": "openswe_oss",
+        "size": null,
+        "harness": "agent",
+        "supported_agents": ["swe-agent", "openhands"],
+        "adaptable": true,
+        "notes": "Open-sourced (redistributable-license) repositories. Each instance ships its own Dockerfile and eval_script, plus the gold patch and test_patch. Grading is rule-based via the OPENSWE_EXIT_CODE marker rather than FAIL_TO_PASS/PASS_TO_PASS (which are empty)."
+      },
+      {
+        "split": "openswe_other",
+        "size": null,
+        "harness": "agent",
+        "supported_agents": ["swe-agent", "openhands"],
+        "adaptable": true,
+        "notes": "Repositories that cannot be redistributed. Only the Dockerfile and eval_script are provided; the gold patch and a separate test_patch field are NOT released, so oracle solutions cannot be verified and the test patch must be kept inside the eval_script."
+      }
+    ],
+    "harbor_adapter": [
+      {
+        "split": "openswe_oss",
+        "adapted_benchmark_size": null,
+        "parity_benchmark_size": null,
+        "parity_sampling_rate": null,
+        "registry_benchmark_size": null,
+        "added_agents": [],
+        "parity_matching_agents": [],
+        "parity_unmatching_agents": null,
+        "parity_costs": "Not tracked",
+        "notes": "Each task is self-contained: the openswe-python-X.Y base image is inlined as continuumio/miniconda3 + a testbed conda env (matching scripts/prepare_baseimg.py), and the build context's repo/ is cloned at base_commit. test.sh applies only the released test_patch on top of the agent's edits, then runs the eval body (with all inline patch heredocs stripped) and converts OPENSWE_EXIT_CODE into a reward."
+      },
+      {
+        "split": "openswe_other",
+        "adapted_benchmark_size": null,
+        "parity_benchmark_size": null,
+        "parity_sampling_rate": null,
+        "registry_benchmark_size": null,
+        "added_agents": [],
+        "parity_matching_agents": [],
+        "parity_unmatching_agents": null,
+        "parity_costs": "Not tracked",
+        "notes": "Eval-only / best-effort: no gold patch is available, so no oracle solution is generated. The eval body keeps test-patch heredocs and strips only those whose surrounding comments mark them as the gold/fix patch."
+      }
+    ]
+  }
+]

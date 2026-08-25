@@ -1,0 +1,26 @@
+[metadata]
+author_name = "unknown"
+author_email = "unknown"
+difficulty = "{difficulty}"
+category = "debugging"
+tags = ["debugging", "swe-bench", "openswe", "python"]
+
+[metadata.extra]
+repo = "{repo}"
+base_commit = "{base_commit}"
+instance_id = "{instance_id}"
+openswe_config = "{openswe_config}"
+
+[verifier]
+# Overall time budget for verification (seconds)
+timeout_sec = {max_timeout}
+
+[agent]
+# Set to same as verifier unless you want to restrict agent time separately
+timeout_sec = {max_timeout}
+
+[environment]
+build_timeout_sec = 3600.0
+cpus = 1
+memory_mb = 4096
+storage_mb = 10240

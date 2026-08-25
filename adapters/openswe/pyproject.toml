@@ -1,0 +1,10 @@
+[project]
+name = "openswe-harbor-adapter"
+version = "0.1.0"
+description = "Converts the GAIR/OpenSWE dataset into Harbor tasks"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=2.16.1",
+    "huggingface-hub>=0.25.0",
+]

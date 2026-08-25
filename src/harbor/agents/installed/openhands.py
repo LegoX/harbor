@@ -790,11 +790,14 @@ class OpenHands(BaseInstalledAgent):
         )
         # Build install command with version logic
         if self._git_version:
-            install_cmd = f"uv pip install git+https://github.com/All-Hands-AI/OpenHands.git@{self._git_version}"
+            install_target = (
+                f"git+https://github.com/All-Hands-AI/OpenHands.git@{self._git_version}"
+            )
         elif self._version:
-            install_cmd = f"uv pip install openhands-ai=={self._version}"
+            install_target = f"openhands-ai=={self._version}"
         else:
-            install_cmd = "uv pip install openhands-ai"
+            install_target = "openhands-ai"
+        install_cmd = f"uv pip install {install_target} 'mcp<2' pydantic-settings"
         await self.exec_as_agent(
             environment,
             command=(

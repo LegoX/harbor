@@ -40,7 +40,7 @@ class OpenHandsSDK(BaseInstalledAgent):
 
     def __init__(
         self,
-        reasoning_effort: str | None = "high",
+        reasoning_effort: str | None = None,
         load_skills: bool = True,
         skill_paths: list[str] | None = None,
         collect_token_ids: bool = False,
@@ -53,7 +53,8 @@ class OpenHandsSDK(BaseInstalledAgent):
         Initialize OpenHands SDK agent.
 
         Args:
-            reasoning_effort: Reasoning effort level (low, medium, high).
+            reasoning_effort: Optional reasoning effort level (low, medium, high).
+                When unset, omit the request field and use the model API default.
             load_skills: Whether to load skills from skill paths.
             skill_paths: Custom skill paths to load from. If None, uses default paths.
             collect_token_ids: When True, request token IDs from the LLM backend
@@ -224,6 +225,9 @@ class OpenHandsSDK(BaseInstalledAgent):
 
         if self._temperature is not None:
             env["LLM_TEMPERATURE"] = str(self._temperature)
+
+        if self._reasoning_effort is not None:
+            env["LLM_REASONING_EFFORT"] = self._reasoning_effort
 
         # Build the command that runs our agent script
         command = f"""

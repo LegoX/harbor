@@ -1,4 +1,8 @@
+import errno
+import hashlib
+import os
 import re
+import stat
 from pathlib import Path
 
 from harbor.models.task.config import TaskConfig
@@ -65,9 +69,89 @@ class Task:
         """Generate a deterministic hash for the task based on its entire directory content."""
         from dirhash import dirhash
 
-        return dirhash(self._task_dir, "sha256")
+        try:
+            return dirhash(self._task_dir, "sha256")
+        except OSError as exc:
+            if not _is_symlink_hash_error(exc):
+                raise
+
+            return _safe_task_dir_hash(self._task_dir)
+        except Exception as exc:
+            if type(exc).__name__ != "SymlinkRecursionError":
+                raise
+
+            return _safe_task_dir_hash(self._task_dir)
 
     @property
     def task_dir(self) -> Path:
         """Public accessor for the task directory."""
         return self._task_dir
+
+
+def _safe_task_dir_hash(task_dir: Path) -> str:
+    """Hash task contents without following symlinks.
+
+    Some benchmark repos intentionally contain invalid or self-referential
+    symlinks. Include symlink metadata in the hash, but never resolve targets.
+    """
+    outer = hashlib.sha256()
+    for root, dirnames, filenames in os.walk(task_dir, followlinks=False):
+        root_path = Path(root)
+        dirnames.sort()
+        filenames.sort()
+
+        for name in list(dirnames):
+            path = root_path / name
+            rel = path.relative_to(task_dir).as_posix()
+            if _is_link_like(path):
+                outer.update(_link_hash_entry(path, rel))
+                dirnames.remove(name)
+
+        for name in filenames:
+            path = root_path / name
+            rel = path.relative_to(task_dir).as_posix()
+            if _is_link_like(path):
+                outer.update(_link_hash_entry(path, rel))
+                continue
+
+            try:
+                file_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                outer.update(_unreadable_hash_entry(path, rel))
+                continue
+
+            outer.update(f"F\0{rel}\0{file_hash}\n".encode())
+
+    return outer.hexdigest()
+
+
+def _is_symlink_hash_error(exc: OSError) -> bool:
+    return exc.errno == errno.ELOOP or getattr(exc, "winerror", None) == 1921
+
+
+def _is_link_like(path: Path) -> bool:
+    try:
+        if os.path.islink(path):
+            return True
+        path_stat = path.lstat()
+    except OSError:
+        return False
+
+    reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    file_attributes = getattr(path_stat, "st_file_attributes", 0)
+    return bool(reparse_point and file_attributes & reparse_point)
+
+
+def _link_hash_entry(path: Path, rel: str) -> bytes:
+    try:
+        target = os.readlink(path)
+    except OSError:
+        path_stat = path.lstat()
+        target = f"<unresolved:{path_stat.st_mode}:{path_stat.st_size}>"
+
+    return f"L\0{rel}\0{target}\n".encode()
+
+
+def _unreadable_hash_entry(path: Path, rel: str) -> bytes:
+    path_stat = path.lstat()
+    return f"U\0{rel}\0{path_stat.st_mode}\0{path_stat.st_size}\n".encode()

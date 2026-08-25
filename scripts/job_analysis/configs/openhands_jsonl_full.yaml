@@ -1,0 +1,59 @@
+# =============================================================================
+# Profile: OpenHands JSONL with all optional analysis stages
+# =============================================================================
+# Use the default OpenHands JSONL layout with dataset metadata and all optional
+# analysis stages enabled.
+# Run: python run.py --config configs/openhands_jsonl_full.yaml
+# =============================================================================
+
+data:
+  log_dir: "<path-to-openhands-job>" # Contains output.critic_attempt_1.jsonl
+  dataset_dir: "<path-to-dataset>/swebench-verified" # Required by instance_analysis
+
+  trajectory_layout: openhands_jsonl
+  gold_source: jsonl
+  trajectory_file: "output.critic_attempt_1.jsonl"
+  test_file: "test-00000-of-00001.jsonl"
+  report_file: "output.critic_attempt_1.report.json"
+  errors_file: "output_errors.jsonl"
+  swebench_file: "output.critic_attempt_1.swebench.jsonl"
+
+output:
+  # Set an explicit output directory or leave it empty for automatic derivation.
+  dir: "output/<your-job-name>"
+  instances_jsonl: "instances.jsonl"
+  report_json: "report.json"
+
+analysis:
+  include_resolved: true
+  include_errors: true
+  include_empty_patch: true
+
+features:
+  loop_threshold: 3
+  premature_stop_threshold: 0.3
+  tool_error_storm_threshold: 5
+
+judge:
+  enabled: false
+  model: "claude-sonnet-4-6"
+  max_trajectory_chars: 8000
+
+hack_detector:
+  enabled: true
+
+# task_analysis.enabled defaults to false.
+
+instance_analysis:
+  enabled: true # Requires metadata.json for each instance under dataset_dir.
+  out_subdir: "instance_analysis"
+
+traj_analysis:
+  enabled: true # Requires a history field in every trajectory JSONL record.
+  out_subdir: "traj_analysis"
+  max_instances: null
+
+scaffold: "openhands"
+model: "<your-model-name>"
+taxonomy_version: "v1"
+judge_version: "v1"

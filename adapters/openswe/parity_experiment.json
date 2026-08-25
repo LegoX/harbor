@@ -1,0 +1,17 @@
+[
+  {
+    "adapter_name": "openswe",
+    "agent": "TBD",
+    "model": "TBD",
+    "date": "TBD",
+    "adapted_benchmark_size": null,
+    "parity_benchmark_size": null,
+    "number_of_trials": null,
+    "notes": "Placeholder. Parity experiments have not yet been run for the OpenSWE adapter. OpenSWE is primarily an SWE training-environment dataset; grading uses the OPENSWE_EXIT_CODE marker emitted by each instance's eval_script. The immediate validation step is verifying that oracle solutions (gold patches in the openswe_oss config) achieve a reward of 1 on a sampled subset.",
+    "original_parity_repo": "https://github.com/GAIR-NLP/OpenSWE",
+    "adapter_pr": [],
+    "dataset_pr": [],
+    "parity_pr": [],
+    "metrics": []
+  }
+]

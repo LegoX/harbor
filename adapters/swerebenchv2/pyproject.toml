@@ -1,0 +1,9 @@
+[project]
+name = "swerebenchv2-harbor-adapter"
+version = "0.1.0"
+description = "SWE-rebench-V2 to Harbor adapter — converts SWE-rebench-V2 instances into Harbor task directories"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "datasets>=2.16.1",
+]
